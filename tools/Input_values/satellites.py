@@ -1,0 +1,1 @@
+sentinel2_harmonized = "COPERNICUS/S2_SR_HARMONIZED"
