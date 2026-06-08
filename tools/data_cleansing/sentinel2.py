@@ -1,7 +1,7 @@
 import ee
 from typing import Callable
 from ee.featurecollection import FeatureCollection
-from tools.Input_values.locaties import build_location_bound, RegionMode
+from tools.Input_data.locaties import build_location_bound, RegionMode
 
 # =========================================================
 # UITLEG MASKERS

@@ -2,7 +2,7 @@ import ee
 import pandas as pd
 
 from ee.featurecollection import FeatureCollection
-from tools.Input_values.locaties import build_location_bound, RegionMode
+from tools.Input_data.locaties import build_location_bound, RegionMode
 from tools.data_analysis.metadata_descriptions import (
     SYSTEM_PROPERTY_DESCRIPTIONS,
     CUSTOM_PROPERTY_DESCRIPTIONS,
