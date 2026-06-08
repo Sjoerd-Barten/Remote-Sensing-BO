@@ -1,9 +1,8 @@
-import math
 import os
-from typing import Any
-
 import ee
+import math
 import pandas as pd
+from typing import Any
 
 
 def df_to_fc(
