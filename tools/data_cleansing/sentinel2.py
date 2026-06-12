@@ -1,7 +1,9 @@
 import ee
 from typing import Callable
 from ee.featurecollection import FeatureCollection
+
 from tools.Input_data.locaties import build_location_bound, RegionMode
+from tools.Input_data.satellites import sentinel2_s2cloudless, sentinel2_cloud_score_plus
 
 # =========================================================
 # UITLEG MASKERS
@@ -10,12 +12,11 @@ from tools.Input_data.locaties import build_location_bound, RegionMode
 # - True / 1  -> pixel blijft behouden
 # - False / 0 -> pixel wordt verborgen
 #
-# Met updateMask(mask) pas je dit masker toe op het beeld.
+# Met updateMask(mask) pas je dit masker toe op een beeld.
 #
 # Let op:
 # Deze functies doen alleen masking.
-# Schalen met .divide(10000) doe je bij voorkeur apart,
-# zodat je niet per ongeluk meerdere keren schaalt.
+# Schalen met .divide(10000) doe je bij voorkeur apart.
 
 
 # =========================================================
@@ -28,36 +29,17 @@ def bloat_zeros_mask(
     """
     Vergroot de verwijderde delen van een binair keep-mask.
 
-    Deze functie verwacht een masker waarin:
-    - 1 / True betekent: pixel behouden
-    - 0 / False betekent: pixel verwijderen
-
-    Met focalMin() wordt in een buurt rondom elke pixel
-    de minimale waarde genomen.
-
-    Daardoor geldt:
-    - als er ergens in de buurt een 0 zit,
-      dan wordt de huidige pixel ook 0
-    - de 0-gebieden groeien dus naar buiten
-    - dit is handig om een extra rand rondom wolken,
-      schaduwen of andere ongewenste pixels mee te verwijderen
-
     Parameters
     ----------
     mask : ee.Image
-        Binair keep-mask waarin 1 betekent behouden
-        en 0 betekent verwijderen.
+        Masker waarin 1 behouden betekent en 0 verwijderen.
     expand_n_meters : int, default 0
-        Afstand in meters waarmee de 0-gebieden
-        naar buiten worden uitgebreid.
-        Als deze waarde 0 of kleiner is,
-        wordt het masker ongewijzigd teruggegeven.
+        Afstand in meters waarmee 0-gebieden worden uitgebreid.
 
     Returns
     -------
     ee.Image
-        Het aangepaste keep-mask waarin de 0-gebieden
-        extra zijn uitgebreid.
+        Het aangepaste masker.
     """
     if expand_n_meters <= 0:
         return mask
@@ -66,25 +48,119 @@ def bloat_zeros_mask(
 
 
 # =========================================================
+# GENERIEKE THRESHOLD MASK FACTORY
+# =========================================================
+def threshold_masking(
+    band_getter: Callable[[ee.Image], ee.Image],
+    threshold: float,
+    keep_below_threshold: bool = True,
+    bloat_n_meters: int = 0,
+) -> Callable[[ee.Image], ee.Image]:
+    """
+    Maakt een mask-functie op basis van een band en drempelwaarde.
+
+    Parameters
+    ----------
+    band_getter : Callable[[ee.Image], ee.Image]
+        Functie die de gewenste band uit een beeld haalt.
+    threshold : float
+        Drempelwaarde voor het masker.
+    keep_below_threshold : bool, default True
+        True  -> behoud waarden lager dan de drempel.
+        False -> behoud waarden groter dan of gelijk aan de drempel.
+    bloat_n_meters : int, default 0
+        Extra buffer rond verwijderde gebieden.
+
+    Returns
+    -------
+    Callable[[ee.Image], ee.Image]
+        Functie die een masker toepast op een beeld.
+    """
+
+    def mask(image: ee.Image) -> ee.Image:
+        # Haal de relevante band op uit het beeld
+        band = band_getter(image)
+
+        # Maak een keep-mask op basis van de ingestelde vergelijking
+        if keep_below_threshold:
+            keep_mask = band.lt(threshold)
+        else:
+            keep_mask = band.gte(threshold)
+
+        # Breid de verwijderde gebieden eventueel uit
+        keep_mask = bloat_zeros_mask(
+            mask=keep_mask,
+            expand_n_meters=bloat_n_meters,
+        )
+
+        # Pas het masker toe op het originele beeld
+        return image.updateMask(keep_mask)
+
+    return mask
+
+
+# =========================================================
+# HULP: TIJDELIJKE BAND OPHALEN UIT EXTERNE COLLECTIE
+# =========================================================
+def make_temporary_matched_band_getter(
+    matching_collection: ee.ImageCollection,
+    source_band_name: str,
+    fallback_value: float,
+) -> Callable[[ee.Image], ee.Image]:
+    """
+    Haalt per beeld tijdelijk een band op uit een externe collectie.
+
+    Er wordt gezocht naar een beeld met dezelfde 'system:index'.
+    Als er geen match is, wordt een constante fallback-band gebruikt.
+
+    Parameters
+    ----------
+    matching_collection : ee.ImageCollection
+        Externe collectie waarin gezocht wordt.
+    source_band_name : str
+        Naam van de band die opgehaald moet worden.
+    fallback_value : float
+        Waarde voor de fallback-band als geen match bestaat.
+
+    Returns
+    -------
+    Callable[[ee.Image], ee.Image]
+        Functie die tijdelijk een passende band teruggeeft.
+    """
+
+    def getter(image: ee.Image) -> ee.Image:
+        # Zoek in de externe collectie naar een beeld
+        # met dezelfde system:index
+        matched = matching_collection.filter(
+            ee.Filter.eq("system:index", image.get("system:index"))
+        ).first()
+
+        # Controleer of er een match bestaat
+        has_match = ee.Algorithms.IsEqual(matched, None).Not()
+
+        # Gebruik de echte band bij een match,
+        # anders een constante fallback-band
+        matched_band = ee.Image(
+            ee.Algorithms.If(
+                has_match,
+                ee.Image(matched).select(source_band_name),
+                ee.Image.constant(fallback_value).rename(source_band_name),
+            )
+        )
+
+        return matched_band
+
+    return getter
+
+
+# =========================================================
 # REFLECTANCE SCALING
 # =========================================================
 def scale_reflectance(image: ee.Image) -> ee.Image:
     """
-    Schaalt Sentinel-2 reflectantiebanden van integerwaarden naar ongeveer 0-1.
-
-    Veel Sentinel-2 reflectantiebanden zijn opgeslagen als gehele getallen
-    en moeten gedeeld worden door 10000 om bruikbare reflectantiewaarden
-    te krijgen.
+    Schaalt Sentinel-2 reflectantiebanden door 10000.
 
     Alleen banden met naam 'B...' worden geschaald.
-    Andere banden, zoals bijvoorbeeld:
-    - SCL
-    - QA60
-    - MSK_CLDPRB
-    blijven ongewijzigd.
-
-    Daardoor blijft deze functie veilig te gebruiken in workflows
-    waarin zowel spectrale banden als kwaliteitsbanden aanwezig zijn.
 
     Parameters
     ----------
@@ -94,10 +170,12 @@ def scale_reflectance(image: ee.Image) -> ee.Image:
     Returns
     -------
     ee.Image
-        Het beeld waarbij alleen de reflectantiebanden
-        zijn geschaald.
+        Het beeld met geschaalde reflectantiebanden.
     """
+    # Selecteer alle spectrale banden en schaal ze
     scaled_reflectance = image.select("B.*").divide(10000)
+
+    # Schrijf de geschaalde banden terug over de originele banden heen
     return image.addBands(scaled_reflectance, overwrite=True)
 
 
@@ -110,63 +188,41 @@ def qa60_cloud_removal_60m(
     """
     Verwijdert bewolkte pixels met behulp van de QA60-band.
 
-    De QA60-band is een quality assessment band in Sentinel-2.
-    In deze band zitten bits opgeslagen die aangeven
-    of een pixel waarschijnlijk wolken of cirrus bevat.
-
-    Gebruikte bits:
-    - bit 10: clouds
-    - bit 11: cirrus
-
-    Werkwijze:
-    1. Lees de QA60-band uit.
-    2. Controleer of bit 10 en bit 11 beide 0 zijn.
-       - 0 betekent: geen wolk/cirrus gedetecteerd
-       - 1 betekent: wel wolk/cirrus gedetecteerd
-    3. Maak hiervan een keep-mask:
-       - True / 1  = pixel behouden
-       - False / 0 = pixel verwijderen
-    4. Breid optioneel de verwijderde gebieden uit
-       met een extra rand in meters.
-
     Parameters
     ----------
     bloat_n_meters : int, default 0
-        Aantal meters waarmee de verwijderde gebieden
-        extra naar buiten worden uitgebreid.
+        Extra buffer rond verwijderde gebieden.
 
     Returns
     -------
     Callable[[ee.Image], ee.Image]
-        Een functie die op een Sentinel-2 beeld
-        een QA60-masker toepast.
+        Functie die een QA60-masker toepast.
     """
 
     def mask(image: ee.Image) -> ee.Image:
         # Selecteer de QA60 quality band
         qa_band = image.select("QA60")
 
-        # Bit 10 stelt "clouds" voor
+        # Bit 10 staat voor clouds
         cloud_bit = 1 << 10
 
-        # Bit 11 stelt "cirrus" voor
+        # Bit 11 staat voor cirrus
         cirrus_bit = 1 << 11
 
-        # Maak een keep-mask:
-        # - bitwiseAnd(cloud_bit) haalt bit 10 op
-        # - eq(0) betekent: behoud alleen pixels zonder cloud-flag
-        # - hetzelfde doen we voor cirrus
+        # Behoud alleen pixels zonder cloud- of cirrus-flag
         keep_mask = (
             qa_band.bitwiseAnd(cloud_bit)
             .eq(0)
             .And(qa_band.bitwiseAnd(cirrus_bit).eq(0))
         )
 
+        # Breid de verwijderde gebieden eventueel uit
         keep_mask = bloat_zeros_mask(
             mask=keep_mask,
             expand_n_meters=bloat_n_meters,
         )
 
+        # Pas het masker toe op het originele beeld
         return image.updateMask(keep_mask)
 
     return mask
@@ -192,81 +248,22 @@ def scl_cloud_removal_20m(
     """
     Verwijdert ongewenste pixels op basis van de SCL-band.
 
-    SCL staat voor Scene Classification Layer.
-    Elke pixel in deze band heeft een klassificatiewaarde
-    die aangeeft tot welke klasse die pixel behoort.
-
-    SCL-klassen:
-    - 1  = Saturated or defective
-    - 2  = Dark Area Pixels
-    - 3  = Cloud Shadows
-    - 4  = Vegetation
-    - 5  = Bare Soils
-    - 6  = Water
-    - 7  = Clouds Low Probability / Unclassified
-    - 8  = Clouds Medium Probability
-    - 9  = Clouds High Probability
-    - 10 = Cirrus
-    - 11 = Snow / Ice
-
-    Voor elke klasse kan worden ingesteld
-    of die pixels verwijderd moeten worden.
-
-    Werkwijze:
-    1. Selecteer de SCL-band.
-    2. Bouw een keep-mask op dat start met overal True / 1.
-    3. Voor elke klasse die verwijderd moet worden:
-       - zet pixels van die klasse op False / 0
-    4. Breid optioneel de verwijderde gebieden uit
-       met een extra rand in meters.
-    5. Pas het uiteindelijke masker toe op het beeld.
-
     Parameters
     ----------
-    remove_saturated_defective : bool, default False
-        Als True, verwijder pixels met klasse 1.
-    remove_dark_area : bool, default False
-        Als True, verwijder pixels met klasse 2.
-    remove_shadow : bool, default True
-        Als True, verwijder pixels met klasse 3.
-    remove_vegetation : bool, default False
-        Als True, verwijder pixels met klasse 4.
-    remove_bare_soils : bool, default False
-        Als True, verwijder pixels met klasse 5.
-    remove_water : bool, default False
-        Als True, verwijder pixels met klasse 6.
-    remove_unclassified : bool, default False
-        Als True, verwijder pixels met klasse 7.
-    remove_medium_cloud : bool, default True
-        Als True, verwijder pixels met klasse 8.
-    remove_high_cloud : bool, default True
-        Als True, verwijder pixels met klasse 9.
-    remove_cirrus : bool, default True
-        Als True, verwijder pixels met klasse 10.
-    remove_snow : bool, default True
-        Als True, verwijder pixels met klasse 11.
     bloat_n_meters : int, default 0
-        Aantal meters waarmee verwijderde gebieden
-        extra naar buiten worden uitgebreid.
+        Extra buffer rond verwijderde gebieden.
 
     Returns
     -------
     Callable[[ee.Image], ee.Image]
-        Een functie die op een Sentinel-2 beeld
-        een SCL-masker toepast.
+        Functie die een SCL-masker toepast.
     """
 
     def mask(image: ee.Image) -> ee.Image:
-        # Kies alleen de SCL-band uit het beeld.
-        # In deze band staat per pixel een klassificatiewaarde.
+        # Kies de SCL-band uit het beeld
         scl_band = image.select("SCL")
 
-        # In deze dictionary koppelen we:
-        # - de SCL-klasse (bijv. 3)
-        # - aan de bijbehorende parameter (bijv. remove_shadow)
-        #
-        # Als de waarde True is, dan wordt die klasse verwijderd.
-        # Als de waarde False is, dan blijft die klasse behouden.
+        # Koppel elke SCL-klasse aan de bijbehorende parameter
         scl_classes_to_remove = {
             1: remove_saturated_defective,
             2: remove_dark_area,
@@ -281,33 +278,21 @@ def scl_cloud_removal_20m(
             11: remove_snow,
         }
 
-        # Start met een masker dat overal 1 / True is.
-        # Dat betekent: in het begin blijft elke pixel zichtbaar.
+        # Start met een masker waarin alles behouden blijft
         keep_mask = ee.Image(1)
 
-        # Doorloop elke SCL-klasse en kijk of deze verwijderd moet worden.
+        # Verwijder klassen die op True staan
         for scl_value, should_remove in scl_classes_to_remove.items():
-            # Alleen als should_remove True is,
-            # voegen we een extra voorwaarde toe aan het masker.
             if should_remove:
-                # scl_band.neq(scl_value) betekent:
-                # houd alleen pixels over die NIET gelijk zijn aan scl_value
-                #
-                # Voorbeeld:
-                # als scl_value = 9,
-                # dan worden alle pixels met SCL == 9 uitgesloten.
-                #
-                # keep_mask.And(...) combineert de nieuwe voorwaarde
-                # met alle eerdere voorwaarden.
                 keep_mask = keep_mask.And(scl_band.neq(scl_value))
 
+        # Breid de verwijderde gebieden eventueel uit
         keep_mask = bloat_zeros_mask(
             mask=keep_mask,
             expand_n_meters=bloat_n_meters,
         )
 
-        # Pas het uiteindelijke masker toe op het originele beeld.
-        # Pixels die False zijn in het masker worden verborgen.
+        # Pas het masker toe op het originele beeld
         return image.updateMask(keep_mask)
 
     return mask
@@ -323,54 +308,24 @@ def probability_cloud_removal_20m(
     """
     Verwijdert pixels op basis van de band 'MSK_CLDPRB'.
 
-    Deze band geeft per pixel de wolk-waarschijnlijkheid.
-    Hoe hoger de waarde, hoe groter de kans dat de pixel
-    bewolkt is.
-
-    Voorbeeld:
-    - threshold = 20
-      => behoud alleen pixels met wolkkans < 20
-
-    Werkwijze:
-    1. Lees de band 'MSK_CLDPRB' uit.
-    2. Maak een keep-mask:
-       - True / 1 voor pixels onder de drempel
-       - False / 0 voor pixels op of boven de drempel
-    3. Breid optioneel de verwijderde gebieden uit.
-
     Parameters
     ----------
     cloud_percent_threshold : int, default 20
         Maximale toegestane wolkkans.
     bloat_n_meters : int, default 0
-        Aantal meters waarmee verwijderde gebieden
-        extra naar buiten worden uitgebreid.
+        Extra buffer rond verwijderde gebieden.
 
     Returns
     -------
     Callable[[ee.Image], ee.Image]
-        Een functie die op een Sentinel-2 beeld
-        een cloud probability masker toepast.
+        Functie die een cloud probability masker toepast.
     """
-
-    def mask(image: ee.Image) -> ee.Image:
-        # Selecteer de cloud probability band
-        cloud_probability = image.select("MSK_CLDPRB")
-
-        # Behoud alleen pixels met een wolk-waarschijnlijkheid
-        # lager dan de ingestelde drempel
-        keep_mask = cloud_probability.lt(cloud_percent_threshold)
-
-        keep_mask = bloat_zeros_mask(
-            mask=keep_mask,
-            expand_n_meters=bloat_n_meters,
-        )
-
-        # Pas het uiteindelijke masker toe op het originele beeld.
-        # Pixels die False zijn in het masker worden verborgen.
-        return image.updateMask(keep_mask)
-
-    return mask
+    return threshold_masking(
+        band_getter=lambda image: image.select("MSK_CLDPRB"),
+        threshold=cloud_percent_threshold,
+        keep_below_threshold=True,
+        bloat_n_meters=bloat_n_meters,
+    )
 
 
 # =========================================================
@@ -383,54 +338,141 @@ def probability_snow_removal_20m(
     """
     Verwijdert pixels op basis van de band 'MSK_SNWPRB'.
 
-    Deze band geeft per pixel de sneeuw-waarschijnlijkheid.
-    Hoe hoger de waarde, hoe groter de kans dat de pixel
-    sneeuw bevat.
-
-    Voorbeeld:
-    - threshold = 20
-      => behoud alleen pixels met sneeuwkans < 20
-
-    Werkwijze:
-    1. Lees de band 'MSK_SNWPRB' uit.
-    2. Maak een keep-mask:
-       - True / 1 voor pixels onder de drempel
-       - False / 0 voor pixels op of boven de drempel
-    3. Breid optioneel de verwijderde gebieden uit.
-
     Parameters
     ----------
     snow_percent_threshold : int, default 20
         Maximale toegestane sneeuwkans.
     bloat_n_meters : int, default 0
-        Aantal meters waarmee verwijderde gebieden
-        extra naar buiten worden uitgebreid.
+        Extra buffer rond verwijderde gebieden.
 
     Returns
     -------
     Callable[[ee.Image], ee.Image]
-        Een functie die op een Sentinel-2 beeld
-        een snow probability masker toepast.
+        Functie die een snow probability masker toepast.
     """
+    return threshold_masking(
+        band_getter=lambda image: image.select("MSK_SNWPRB"),
+        threshold=snow_percent_threshold,
+        keep_below_threshold=True,
+        bloat_n_meters=bloat_n_meters,
+    )
 
-    def mask(image: ee.Image) -> ee.Image:
-        # Selecteer de snow probability band
-        snow_probability = image.select("MSK_SNWPRB")
 
-        # Behoud alleen pixels met een sneeuw-waarschijnlijkheid
-        # lager dan de ingestelde drempel
-        keep_mask = snow_probability.lt(snow_percent_threshold)
+# =========================================================
+# S2CLOUDLESS CLOUD REMOVAL
+# =========================================================
+def s2cloudless_cloud_removal(
+    cloud_percent_threshold: int = 20,
+    bloat_n_meters: int = 0,
+) -> Callable[[ee.Image], ee.Image]:
+    """
+    Verwijdert pixels met behulp van de S2Cloudless probability-band.
 
-        keep_mask = bloat_zeros_mask(
-            mask=keep_mask,
-            expand_n_meters=bloat_n_meters,
-        )
+    Parameters
+    ----------
+    cloud_percent_threshold : int, default 20
+        Maximale toegestane wolkkans tussen 100 en 0.
+    bloat_n_meters : int, default 0
+        Extra buffer rond verwijderde gebieden.
 
-        # Pas het uiteindelijke masker toe op het originele beeld.
-        # Pixels die False zijn in het masker worden verborgen.
-        return image.updateMask(keep_mask)
+    Returns
+    -------
+    Callable[[ee.Image], ee.Image]
+        Functie die een cloud probability masker toepast.
+    """
+    # Gebruik de centraal gedefinieerde S2Cloudless-collectie
+    cloud_probability_collection = sentinel2_s2cloudless
+    source_band_name = "probability"
+    fallback_value = 100
 
-    return mask
+    return threshold_masking(
+        band_getter=make_temporary_matched_band_getter(
+            matching_collection=cloud_probability_collection,
+            source_band_name=source_band_name,
+            fallback_value=fallback_value,
+        ),
+        threshold=cloud_percent_threshold,
+        keep_below_threshold=True,
+        bloat_n_meters=bloat_n_meters,
+    )
+
+
+# =========================================================
+# CLOUD SCORE+ CS REMOVAL
+# =========================================================
+def cloudscoreplus_cs_removal(
+    min_score_threshold: float = 0.6,
+    bloat_n_meters: int = 0,
+) -> Callable[[ee.Image], ee.Image]:
+    """
+    Verwijdert pixels met behulp van de Cloud Score+ cs-band.
+
+    Parameters
+    ----------
+    min_score_threshold : float, default 0.6
+        Minimale toegestane score tussen 1 en 0.
+    bloat_n_meters : int, default 0
+        Extra buffer rond verwijderde gebieden.
+
+    Returns
+    -------
+    Callable[[ee.Image], ee.Image]
+        Functie die een cs-masker toepast.
+    """
+    # Gebruik de centraal gedefinieerde Cloud Score+ collectie
+    cloudscore_collection = ee.ImageCollection(sentinel2_cloud_score_plus)
+    source_band_name = "cs"
+    fallback_value = 0
+
+    return threshold_masking(
+        band_getter=make_temporary_matched_band_getter(
+            matching_collection=cloudscore_collection,
+            source_band_name=source_band_name,
+            fallback_value=fallback_value,
+        ),
+        threshold=min_score_threshold,
+        keep_below_threshold=False,
+        bloat_n_meters=bloat_n_meters,
+    )
+
+
+# =========================================================
+# CLOUD SCORE+ CS_CDF REMOVAL
+# =========================================================
+def cloudscoreplus_cdf_removal(
+    min_score_threshold: float = 0.6,
+    bloat_n_meters: int = 0,
+) -> Callable[[ee.Image], ee.Image]:
+    """
+    Verwijdert pixels met behulp van de Cloud Score+ cs_cdf-band.
+
+    Parameters
+    ----------
+    min_score_threshold : float, default 0.6
+        Minimale toegestane score tussen 1 en 0.
+    bloat_n_meters : int, default 0
+        Extra buffer rond verwijderde gebieden.
+
+    Returns
+    -------
+    Callable[[ee.Image], ee.Image]
+        Functie die een cs_cdf-masker toepast.
+    """
+    # Gebruik de centraal gedefinieerde Cloud Score+ collectie
+    cloudscore_collection = ee.ImageCollection(sentinel2_cloud_score_plus)
+    source_band_name = "cs_cdf"
+    fallback_value = 0
+
+    return threshold_masking(
+        band_getter=make_temporary_matched_band_getter(
+            matching_collection=cloudscore_collection,
+            source_band_name=source_band_name,
+            fallback_value=fallback_value,
+        ),
+        threshold=min_score_threshold,
+        keep_below_threshold=False,
+        bloat_n_meters=bloat_n_meters,
+    )
 
 
 # =========================================================
@@ -442,48 +484,22 @@ def add_local_cloud_cover(
     buffer_m: int = 0,
 ) -> Callable[[ee.Image], ee.Image]:
     """
-    Berekent lokale bewolkingsgraad binnen een opgegeven gebied
-    en slaat deze op als image property 'LOCAL_CLOUD_COVER'.
-
-    De berekening gebruikt de SCL-band en telt binnen het gekozen gebied
-    hoeveel pixels tot een wolk-gerelateerde klasse behoren.
-
-    Gebruikte wolkklassen:
-    - 3  = Cloud Shadows
-    - 8  = Clouds Medium Probability
-    - 9  = Clouds High Probability
-    - 10 = Cirrus
-
-    Werkwijze:
-    1. Bouw een analysegebied op basis van de opgegeven locaties.
-    2. Maak een binaire cloud-band:
-       - 1 = wolk / schaduw
-       - 0 = geen wolk
-    3. Maak een valid-band:
-       - 1 = geldige pixel
-       - 0 = geen data
-    4. Tel binnen het gebied:
-       - het aantal wolkpixels
-       - het aantal geldige pixels
-    5. Bereken:
-       LOCAL_CLOUD_COVER = cloudy_pixels / valid_pixels * 100
+    Berekent lokale bewolkingsgraad en slaat die op als
+    image property 'LOCAL_CLOUD_COVER'.
 
     Parameters
     ----------
     locations_of_interest : FeatureCollection
-        De locaties waarbinnen lokale bewolking
-        moet worden bepaald.
+        Locaties waarbinnen bewolking bepaald wordt.
     coverage : RegionMode, default "geometry"
-        Bepaalt hoe het analysegebied wordt opgebouwd.
-        Deze waarde wordt doorgegeven aan build_location_bound().
+        Manier waarop het analysegebied wordt opgebouwd.
     buffer_m : int, default 0
-        Extra buffer in meters rond het analysegebied.
+        Extra buffer rond het analysegebied.
 
     Returns
     -------
     Callable[[ee.Image], ee.Image]
-        Een functie die aan elk beeld de property
-        'LOCAL_CLOUD_COVER' toevoegt.
+        Functie die 'LOCAL_CLOUD_COVER' toevoegt aan een beeld.
     """
     cloud_classes = [3, 8, 9, 10]
 
@@ -500,9 +516,11 @@ def add_local_cloud_cover(
         # Maak een binaire cloud-band:
         # 1 = wolk / schaduw
         # 0 = geen wolk
-        cloud_mask = scl_band.remap(cloud_classes, [1] * len(cloud_classes), 0).rename(
-            "cloud"
-        )
+        cloud_mask = scl_band.remap(
+            cloud_classes,
+            [1] * len(cloud_classes),
+            0,
+        ).rename("cloud")
 
         # Maak een valid-band:
         # 1 = geldige pixel
