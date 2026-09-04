@@ -1,0 +1,458 @@
+---
+title: "Datacollectie"
+jupyter: python3
+---
+
+## Initialisatie
+
+Deze notebook bouwt de invoer voor de analyse op en verzamelt vervolgens
+Sentinel-2-statistieken voor de onderzoekslocaties. De workflow gebruikt
+Google Earth Engine (EE) voor de satellietbeelden en lokale CSV-invoer voor
+de plotlocaties.
+
+### Imports
+
+#### Concept en context
+
+De workflow combineert lokale tabeldata met Earth Engine-collecties. De
+onderstaande imports laden daarom zowel de algemene Python-pakketten als de
+projectspecifieke routines voor geometrie, kwaliteitsmaskering, spectrale
+indices en statistiekextractie.
+
+#### Uitleg van de code
+
+De functies worden uit de projectmappen geïmporteerd. Daarmee blijft de
+implementatie van bijvoorbeeld polygonconversie, cloud masking en
+reflectantieschaling buiten dit notebook en kan dezelfde logica opnieuw worden
+gebruikt. De lijst met `calc_*`-functies bevat de beschikbare Sentinel-2
+spectrale indices; in deze workflow wordt daaruit later `calc_ndvi` gebruikt.
+
+```{python}
+import os
+import ee
+import pandas as pd
+from dotenv import load_dotenv
+
+from tools.Input_data.satellites import sentinel2_harmonized
+from tools.Input_data.cord_to_plot import PointType, corners_to_columns
+from tools.Input_data.locaties import select_naturenreserves, RegionMode
+from tools.Input_data.Polygons import load_features
+from tools.extract_downloads.ee import estimate_extraction_workload ,build_imagecollection_stats, export_featurecollection_to_local, export_featurecollection_to_drive
+from tools.data_cleansing.sentinel2 import add_local_cloud_cover, scl_cloud_removal_20m, scale_reflectance, s2cloudless_cloud_removal, cloudscoreplus_cs_removal, cloudscoreplus_cdf_removal
+from tools.calculate_spectral_indices.sentinel2 import (
+    calc_bsi,
+    calc_cire, 
+    calc_evi ,
+    calc_evi2,
+    calc_fai,
+    calc_gci,
+    calc_gndvi,
+    calc_ibi,
+    calc_mndwi,
+    calc_msi,
+    calc_nbr,
+    calc_nbr2,
+    calc_ndbi,
+    calc_ndmi,
+    calc_ndre_b5,
+    calc_ndre_b6,
+    calc_ndre_b7,
+    calc_ndsi,
+    calc_ndti,
+    calc_ndvi,
+    calc_ndwi,
+    calc_nirv,
+    calc_osavi,
+    calc_s2wi,
+    calc_savi,
+    calc_snow_brightness,
+    calc_vari,
+)
+```
+
+#### Outputs
+
+De benodigde bibliotheken, datasets en routines zijn beschikbaar in de
+notebookomgeving. Er wordt nog geen satellietdata verwerkt.
+
+### Specialistische functies
+
+#### Concept en context
+
+Datums komen in de invoer per plot mogelijk meerdere keren voor. Voor de
+groepsgewijze verwerking is daarom één stabiele tekstrepresentatie van de
+unieke meetdatums nodig.
+
+#### Uitleg van de code
+
+`join_unique_dates` verwacht waarden in het formaat `YYYYMMDD`, zet ongeldige
+waarden om naar ontbrekende waarden, verwijdert duplicaten en sorteert de
+overgebleven datums. De scheidingstekens zorgen dat meerdere datums als één
+plotattribuut kunnen worden opgeslagen.
+
+```{python}
+def join_unique_dates(series: pd.Series) -> str:
+    """
+    Zet een pandas Series met datumwaarden om naar één string
+    met unieke, gesorteerde datums in ISO-formaat.
+
+    Parameters
+    ----------
+    series : pd.Series
+        Series met datumwaarden, bij voorkeur in het formaat YYYYMMDD.
+
+    Returns
+    -------
+    str
+        Een string met unieke datums, gescheiden door komma's,
+        bijvoorbeeld: "2020-07-10|2020-07-11".
+    """
+    dates = pd.to_datetime(series.astype(str), format="%Y%m%d", errors="coerce")
+    dates = dates.dropna().drop_duplicates().sort_values()
+    return "| ".join(dates.dt.strftime("%Y-%m-%d"))
+```
+
+#### Outputs
+
+De functie is beschikbaar voor de groepering van de plotinvoer in een
+volgende stap.
+
+### Notebookproject instellen
+
+#### Concept en context
+
+Earth Engine vereist een geconfigureerd project en authenticatie. Het
+project-ID wordt buiten de notebook beheerd via een `.env`-bestand, zodat
+credentials en projectinstellingen niet in de workflowcode hoeven te staan.
+
+#### Uitleg van de code
+
+`load_dotenv()` leest de omgevingsvariabelen in. `PROJECT_CODE_EE` is
+verplicht. Eerst wordt geprobeerd een bestaande EE-sessie te initialiseren;
+als dat niet lukt, volgt interactieve authenticatie. De
+`pandas`-instellingen vergroten alleen de zichtbaarheid van tabellen in een
+interactieve omgeving.
+
+```{python}
+load_dotenv()
+
+project_code_ee = os.getenv("PROJECT_CODE_EE")
+
+if not project_code_ee:
+    raise RuntimeError("PROJECT_CODE_EE not found")
+
+try:
+    ee.Initialize(project=project_code_ee)
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=project_code_ee)
+```
+
+```{python}
+pd.set_option("display.max_rows", 250)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", None)
+```
+
+#### Outputs
+
+De Earth Engine-sessie is geïnitialiseerd en de tabelweergave is ingesteld.
+De volgende stappen kunnen nu EE-collecties en -geometrieën gebruiken.
+
+### Standaardwaarden project
+
+#### Concept en context
+
+Deze parameters leggen het projectgebied, de periode, de kwaliteitsfilters en
+de vorm van de onderzoekscellen vast. De waarden zijn standaard ingesteld
+voor deze analyse, maar kunnen worden aangepast om dezelfde workflow voor een
+ander gebied of een andere periode te reproduceren.
+
+#### Uitleg van de code
+
+`select_naturenreserves` selecteert het natuurgebied uit de WDPA-dataset.
+Voor de gebiedsafbakening wordt standaard de bounding box gebruikt
+(`type_coverage = "bounds"`); de buffer staat op nul meter. De
+Sentinel-2-periode loopt van `filter_date_start` inclusief tot
+`filter_date_end` exclusief. Alleen beelden met een lokale bewolkingsgraad
+onder `local_cloud_cover_threshold` zouden worden geselecteerd als die
+optionele stap wordt geactiveerd.
+
+De CSV bevat de plotcoördinaten in `EPSG:28992`. Rond elke coördinaat wordt
+een cel van 10 bij 10 meter geconstrueerd, 30 graden rechtsom gedraaid, met
+de opgegeven coördinaat als middelpunt. `bands_to_revieuw` bepaalt welke
+indexbanden voor de statistieken worden gebruikt; hier is dat NDVI. De
+standaard uitvoerschaal is 10 meter en de genoemde feature- en
+image-eigenschappen worden in de resultaten behouden.
+
+```{python}
+# Projectgebied
+natuurgebieden = select_naturenreserves(["Nieuwkoopse Plassen & de Haeck"])
+type_coverage: RegionMode = "bounds"
+buffer_size_meters: int = 0
+
+filter_date_start: str = "2026-01-01"
+filter_date_end: str = "2027-07-12"
+local_cloud_cover_threshold: int = 30
+cloud_cover_bloat: int = 100
+
+# onderzoekslocaties
+inputdata_cord_sys: str = r"EPSG:28992"
+inputdata_pq_plot_csv: str = r"C:\Users\BaSj\Downloads\PQ_coordinaat_datum_Sjoerd.csv"
+cell_size_width: int = 10  # meters
+cell_size_height: int = 10  # meters
+rotation_deg: int = 30  # clockwise rotation
+corner_type: PointType = (
+    "center"  # "center", "top_left", "top_right", "bottom_right", "bottom_left"
+)
+
+bands_to_revieuw : list[str] = ["NDVI"]
+scale_output_raster: int = 10
+feature_columns_keep=["PQ_nummer", "Datum"]
+image_columns_keep=["MGRS_TILE"]
+```
+
+#### Outputs
+
+De projectinstellingen zijn beschikbaar als variabelen. `natuurgebieden`
+bevat de geselecteerde EE-gebieden; de overige variabelen sturen de
+constructie, selectie en samenvatting van de satellietdata.
+
+## Code
+
+### Onderzoeksgebieden plotten
+
+#### Concept en context
+
+De lokale CSV vormt de bron voor de onderzoekslocaties. Eerst worden rijen
+met hetzelfde plotnummer en dezelfde coördinaat samengevoegd, zodat elke
+onderzoekscel één geometrie krijgt en alle meetdatums als metadata behouden
+blijven.
+
+#### Uitleg van de code
+
+`pd.read_csv` leest het bestand uit `inputdata_pq_plot_csv`. De groepering
+gebruikt `PQ_nummer`, `X` en `Y` als sleutel en past de specialistische
+functie `join_unique_dates` toe op `Datum`.
+
+```{python}
+locations_df = pd.read_csv(inputdata_pq_plot_csv)
+
+unique_groups = locations_df.groupby(["PQ_nummer", "X", "Y"], as_index=False).agg(
+    {"Datum": join_unique_dates}
+)
+```
+
+#### Outputs
+
+`unique_groups` bevat één rij per unieke plotlocatie, met een samengevoegde
+datumreeks.
+
+#### Concept en context
+
+Earth Engine werkt met polygonen. Daarom worden de puntcoördinaten vertaald
+naar de hoekpunten van rechthoekige onderzoekscellen met de hierboven
+ingestelde afmetingen, rotatie en interpretatie van het invoerpunt.
+
+#### Uitleg van de code
+
+`corners_to_columns` gebruikt per rij de kolommen `X` en `Y` en retourneert
+acht hoekcoördinaten. Deze worden naast de gegroepeerde plotdata geplaatst.
+
+```{python}
+# Bereken de hoekcoördinaten voor elke rij
+corner_cols = unique_groups.apply(
+    corners_to_columns,
+    x_col="X",
+    y_col="Y",
+    axis=1,
+    width=cell_size_width,
+    height=cell_size_height,
+    rotation_deg=rotation_deg,
+    point_type=corner_type,
+)
+
+# Voeg de nieuwe hoekkolommen toe aan de originele DataFrame
+input_plots = pd.concat([unique_groups, corner_cols], axis=1)
+```
+
+#### Outputs
+
+`input_plots` bevat de plotmetadata en de hoekpunten `x_tl` tot en met
+`y_bl`, die nodig zijn om polygonen in Earth Engine op te bouwen.
+
+#### Concept en context
+
+De tabelpolygonen moeten naar een EE `FeatureCollection` worden omgezet
+voordat zij als analysegebied voor de beeldcollectie en statistiekextractie
+kunnen dienen.
+
+#### Uitleg van de code
+
+`load_features` zet de DataFrame om naar één EE-feature per rij. De
+coördinaten worden geïnterpreteerd in het standaard-CRS `EPSG:28992` en
+`feature_columns_keep` wordt als feature-eigenschap meegenomen. De routine
+print standaard een samenvatting van het aantal features en de oppervlakte.
+
+```{python}
+input_data_feat_class = load_features(input_plots, feature_columns_keep)
+```
+
+#### Outputs
+
+`input_data_feat_class` is de EE `FeatureCollection` met de
+onderzoekscellen en hun plotmetadata.
+
+### Satellietdatabase opzetten
+
+#### Concept en context
+
+De Sentinel-2-collectie wordt beperkt tot beelden die binnen de periode en
+het projectgebied vallen. Daarna worden wolken gemaskeerd, reflectanties
+geschaald en NDVI berekend. Deze volgorde maakt de index geschikt voor de
+latere pixelstatistieken.
+
+#### Uitleg van de code
+
+`sentinel2_harmonized` is de geharmoniseerde Sentinel-2-collectie.
+`cloudscoreplus_cs_removal(0.6, 0)` behoudt pixels met een Cloud Score+
+`cs`-score van minimaal 0,6 zonder extra buffer. `scale_reflectance` deelt
+de reflectantiebanden door 10000. De twee regels voor lokale bewolking en
+SCL-maskering zijn optioneel en blijven daarom commented out. Tot slot voegt
+`calc_ndvi` de NDVI-band toe.
+
+```{python}
+s2 = (
+    ee.ImageCollection(sentinel2_harmonized)
+    .filterDate(filter_date_start, filter_date_end)
+    .filterBounds(natuurgebieden)
+    # .map(add_local_cloud_cover(natuurgebieden, coverage=type_coverage))
+    # .map(scl_cloud_removal_20m(remove_unclassified=False, bloat_n_meters=cloud_cover_bloat))
+    .map(cloudscoreplus_cs_removal(0.6, 0))
+    .map(scale_reflectance)
+    .map(calc_ndvi)
+)
+```
+
+#### Outputs
+
+`s2` is de gefilterde en voorbewerkte EE `ImageCollection` met geschaalde
+reflectantiebanden en NDVI.
+
+### Kosten schatten
+
+#### Concept en context
+
+Statistiekextractie in Earth Engine kan omvangrijk zijn. Vooraf wordt daarom
+de verwachte workload berekend op basis van dezelfde features, beelden,
+banden, schaal en statistieken als in de resultaatstap.
+
+#### Uitleg van de code
+
+De schatting gebruikt NDVI op 10 meter en vraagt gemiddelde, mediaan,
+percentielen 25 en 75, standaarddeviatie, minimum/maximum en pixelcount op.
+De functie voert hiermee een kosten- en omvangsinschatting uit zonder de
+resultaten naar een lokaal bestand te exporteren.
+
+```{python}
+estimate_extraction_workload(
+    feature_collection = input_data_feat_class,
+    image_collection= s2,
+    band_names= bands_to_revieuw,
+    scale= scale_output_raster,
+    include_mean= True,
+    include_median= True,
+    include_percentiles= (25, 75),
+    include_stddev= True,
+    include_minmax = True,
+    include_count= True,
+)
+```
+
+#### Outputs
+
+De functie geeft een workloadschatting terug in de notebookuitvoer. Deze
+schatting kan worden gebruikt om de extractie te controleren voordat de
+statistieken worden berekend.
+
+### Resultaten berekenen
+
+#### Concept en context
+
+Voor elke combinatie van onderzoekscel en Sentinel-2-beeld worden de
+pixelwaarden binnen de cel samengevat. De feature- en image-metadata worden
+tegelijk toegevoegd, zodat de tabel later aan plots, datums en satelliettiles
+kan worden gekoppeld.
+
+#### Uitleg van de code
+
+`build_imagecollection_stats` gebruikt dezelfde collectie en schaal als de
+workloadschatting en projecteert de geometrieën naar `EPSG:28992`. Naast
+pixelcount en datum worden gemiddelde, mediaan, percentielen 25 en 75 en
+standaarddeviatie berekend. Minimum en maximum zijn hier bewust uitgeschakeld.
+De functie behoudt `PQ_nummer` en `Datum` uit de features en `MGRS_TILE` uit
+de beelden. De geretourneerde dictionary bevat onder meer de resultaat-
+`FeatureCollection`, selectors en de workloadschatting.
+
+```{python}
+resultaten = build_imagecollection_stats(
+    feature_collection= input_data_feat_class,
+    image_collection= s2,
+    band_names= bands_to_revieuw,
+    scale= scale_output_raster,
+    crs= "EPSG:28992",
+    
+    feature_property_columns=feature_columns_keep,
+    image_property_columns=image_columns_keep,
+
+    include_count=True,
+    include_date=True,
+
+    include_mean= True,
+    include_median= True,
+    include_percentiles = (25, 75),
+    include_stddev = True,
+    include_minmax = False,
+
+)
+resultaten["workload_estimate"]
+```
+
+#### Outputs
+
+`resultaten["result_feature_collection"]` bevat de berekende
+NDVI-statistieken per plot en beeld. `resultaten["selectors"]` beschrijft de
+kolommen voor export en `resultaten["workload_estimate"]` geeft de bijbehorende
+schatting weer.
+
+De lokale en Drive-export zijn optioneel. Ze staan hieronder commented out
+zodat het berekenen van de resultaten niet automatisch een bestand of
+Drive-taak aanmaakt.
+
+```{python}
+# output_df = export_featurecollection_to_local(
+#     feature_collection=resultaten["result_feature_collection"],
+#     local_file_path=r"output/resultaten.csv",
+#     keep_geometry=True,
+#     file_format="csv"
+# )
+```
+
+```{python}
+# output_drive = export_featurecollection_to_drive(
+#     feature_collection=resultaten["result_feature_collection"],
+#     description="testrun",
+#     file_name_prefix="OutputresultatenSentinel2",
+#     folder="Remote_Sensing",
+#     file_format="CSV",
+#     selectors=resultaten["selectors"],
+#     include_geometry=False
+# )
+```
+
+#### Outputs
+
+Wanneer de lokale export wordt geactiveerd, schrijft de workflow de
+resultaat-`FeatureCollection` naar `output/resultaten.csv`. De Drive-export
+maakt in plaats daarvan een CSV-exporttaak aan in de map `Remote_Sensing`;
+beide uitvoerbestanden zijn optioneel.
