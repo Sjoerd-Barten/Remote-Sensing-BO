@@ -136,15 +136,15 @@ def make_temporary_matched_band_getter(
         ).first()
 
         # Controleer of er een match bestaat
-        has_match = ee.Algorithms.IsEqual(matched, None).Not()
+        has_match = ee.Algorithms.IsEqual(matched, None)
 
         # Gebruik de echte band bij een match,
         # anders een constante fallback-band
         matched_band = ee.Image(
             ee.Algorithms.If(
                 has_match,
-                ee.Image(matched).select(source_band_name),
                 ee.Image.constant(fallback_value).rename(source_band_name),
+                ee.Image(matched).select(source_band_name),
             )
         )
 
